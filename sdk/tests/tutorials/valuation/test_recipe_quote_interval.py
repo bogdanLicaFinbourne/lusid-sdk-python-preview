@@ -1,15 +1,16 @@
 import unittest
 from datetime import datetime
-
+from datetime import timedelta
 import pytz
+import uuid
 
 import lusid
 import lusid.models as models
-from utilities import InstrumentLoader
 from utilities import TestDataUtilities
+from utilities import PortfolioLoader
 
 
-class Valuation(unittest.TestCase):
+class QuoteIntervalRecipe(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Create a configured API client
@@ -22,24 +23,35 @@ class Valuation(unittest.TestCase):
         cls.aggregation_api = lusid.AggregationApi(api_client)
         cls.quotes_api = lusid.QuotesApi(api_client)
         cls.recipes_api = lusid.ConfigurationRecipeApi(api_client)
-        instrument_loader = InstrumentLoader(cls.instruments_api)
-        cls.instrument_ids = instrument_loader.load_instruments()
 
         # Setup test data from utilities
         cls.test_data_utilities = TestDataUtilities(cls.transaction_portfolios_api)
 
-        # Set test parameters
-        cls.effective_date = datetime(2019, 4, 15, tzinfo=pytz.utc)
+        # Setup test parameters
+        cls.trade_date = datetime(2019, 4, 15, tzinfo=pytz.utc)
+        cls.valuation_date = datetime(2019, 4, 15, tzinfo=pytz.utc)
+
+        # Setup scopes for tests
+        cls.recipe_scope = "TestQuoteInterval"
+        cls.recipe_code = "SimpleQuotes"
+
+        # Set market data scope for quotes and recipes
+        cls.market_data_provider = "Lusid"
+        cls.market_data_scope = "Test-" + str(uuid.uuid4())
+
+        # Setup test portfolio
+        cls.portfolio_scope = TestDataUtilities.tutorials_scope
         cls.portfolio_code = cls.test_data_utilities.create_transaction_portfolio(
             TestDataUtilities.tutorials_scope
         )
 
-        # Setup scopes for recipe tests
-        cls.recipe_scope = "TestIdentifiers"
-        cls.recipe_code = "SimpleQuotes"
-
-        # Setup test portfolio
-        cls.setup_portfolio(cls.effective_date, cls.portfolio_code)
+        # Load transactions to test portfolio
+        portfolio_loader = PortfolioLoader(
+            cls.transaction_portfolios_api, cls.instruments_api
+        )
+        portfolio_loader.setup_gbp_portfolio(
+            cls.portfolio_scope, cls.portfolio_code, cls.valuation_date
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -48,86 +60,18 @@ class Valuation(unittest.TestCase):
             TestDataUtilities.tutorials_scope, cls.portfolio_code
         )
 
-    @classmethod
-    def setup_portfolio(cls, effective_date, portfolio_code) -> None:
-        """
-        Sets up instrument, quotes and portfolio data from TestDataUtilities
-        :param datetime effective_date: The portfolio creation date
-        :param str portfolio_code: The code of the the test portfolio
-        :return: None
-        """
-
-        transactions = [
-            cls.test_data_utilities.build_transaction_request(
-                instrument_id=cls.instrument_ids[0],
-                units=100,
-                price=101,
-                currency="GBP",
-                trade_date=effective_date,
-                transaction_type="StockIn",
-            ),
-            cls.test_data_utilities.build_transaction_request(
-                instrument_id=cls.instrument_ids[1],
-                units=100,
-                price=102,
-                currency="GBP",
-                trade_date=effective_date,
-                transaction_type="StockIn",
-            ),
-            cls.test_data_utilities.build_transaction_request(
-                instrument_id=cls.instrument_ids[2],
-                units=100,
-                price=103,
-                currency="GBP",
-                trade_date=effective_date,
-                transaction_type="StockIn",
-            ),
-        ]
-
-        cls.transaction_portfolios_api.upsert_transactions(
-            scope=TestDataUtilities.tutorials_scope,
-            code=portfolio_code,
-            transaction_request=transactions,
-        )
-
-        prices = [
-            (cls.instrument_ids[0], 100),
-            (cls.instrument_ids[1], 200),
-            (cls.instrument_ids[2], 300),
-        ]
-
-        requests = [
-            models.UpsertQuoteRequest(
-                quote_id=models.QuoteId(
-                    models.QuoteSeriesId(
-                        provider="Lusid",
-                        instrument_id=price[0],
-                        instrument_id_type="LusidInstrumentId",
-                        quote_type="Price",
-                        field="mid",
-                    ),
-                    effective_at=effective_date,
-                ),
-                metric_value=models.MetricValue(value=price[1], unit="GBP"),
-            )
-            for price in prices
-        ]
-
-        cls.quotes_api.upsert_quotes(
-            TestDataUtilities.tutorials_scope,
-            request_body={
-                "quote" + str(request_number): requests[request_number]
-                for request_number in range(len(requests))
-            },
-        )
-
     def create_configuration_recipe(
-        self, recipe_scope, recipe_code
+        self, recipe_scope, recipe_code, quote_interval
     ) -> lusid.models.ConfigurationRecipe:
         """
-        Creates a configuration recipe that can be used inline or upserted
+        Creates a configuration recipe that can be used inline or upserted,
+        using a 'quote_interval' to look back for pricing data in the quotes
+        store when missing for the selected valuation date. The interval is
+        specified as a dot separated string with a start and end period, e.g.
+        1W.0D to look back 1W starting today (0 days ago).
         :param str recipe_scope: The scope for the configuration recipe
         :param str recipe_code: The code of the the configuration recipe
+        :param str quote_interval: The look back interval for quotes data
         :return: ConfigurationRecipe
         """
 
@@ -135,12 +79,23 @@ class Valuation(unittest.TestCase):
             scope=recipe_scope,
             code=recipe_code,
             market=models.MarketContext(
-                market_rules=[],
-                suppliers=models.MarketContextSuppliers(equity="Lusid"),
+                market_rules=[
+                    models.MarketDataKeyRule(
+                        key="Equity.Figi.*",
+                        supplier="Lusid",
+                        data_scope=self.market_data_scope,
+                        quote_type="Price",
+                        field="mid",
+                        quote_interval=quote_interval,
+                    ),
+                ],
+                suppliers=models.MarketContextSuppliers(
+                    equity=self.market_data_provider
+                ),
                 options=models.MarketOptions(
-                    default_supplier="Lusid",
-                    default_instrument_code_type="LusidInstrumentId",
-                    default_scope=TestDataUtilities.tutorials_scope,
+                    default_supplier=self.market_data_provider,
+                    default_instrument_code_type="Figi",
+                    default_scope=self.market_data_scope,
                 ),
             ),
         )
@@ -189,17 +144,65 @@ class Valuation(unittest.TestCase):
                 )
             ],
             valuation_schedule=models.ValuationSchedule(
-                effective_from=self.effective_date, effective_at=self.effective_date
+                effective_from=self.valuation_date, effective_at=self.valuation_date
             ),
         )
 
-    def test_valuation(self) -> None:
+    def upsert_quotes(self, quotes_date) -> models.UpsertQuotesResponse:
         """
-        General valuation test using an upserted recipe
+        Upserts quotes into LUSID to be used in pricing valuation
+        :param datetime quotes_date: The date of the upserted quotes
+        :return: UpsertQuotesResponse
         """
 
+        prices = [
+            ("BBG000BF46Y8", 100),
+            ("BBG000PQKVN8", 200),
+            ("BBG000FD8G46", 300),
+        ]
+
+        requests = [
+            models.UpsertQuoteRequest(
+                quote_id=models.QuoteId(
+                    models.QuoteSeriesId(
+                        provider="Lusid",
+                        instrument_id=price[0],
+                        instrument_id_type="Figi",
+                        quote_type="Price",
+                        field="mid",
+                    ),
+                    effective_at=quotes_date,
+                ),
+                metric_value=models.MetricValue(value=price[1], unit="GBP"),
+            )
+            for price in prices
+        ]
+
+        return self.quotes_api.upsert_quotes(
+            scope=self.market_data_scope,
+            request_body={
+                "quote" + str(request_number): requests[request_number]
+                for request_number in range(len(requests))
+            },
+        )
+
+    def test_quote_interval(self):
+        """
+        Tests that a recipe including a 'quote_interval' parameter
+        reconciles market data when not within the selected valuation
+        date or time-interval. LUSID will look back for prices in the quotes
+        store based on the specified interval in the 'MarketDataKeyRule'
+        :return: None
+        """
+
+        # Upsert quotes with a timedelta of 2 days against out valuation date
+        quotes_response = self.upsert_quotes(self.valuation_date - timedelta(days=2))
+        self.assertEqual(len(quotes_response.failed), 0)
+
         # Upsert recipe
-        recipe = self.create_configuration_recipe(self.recipe_scope, self.recipe_code)
+        recipe = self.create_configuration_recipe(
+            self.recipe_scope, self.recipe_code, "2D.0D"
+        )
         self.upsert_recipe_request(recipe)
 
         # Set valuation result key
@@ -210,9 +213,8 @@ class Valuation(unittest.TestCase):
             self.recipe_scope, self.recipe_code
         )
 
-        # Complete valuation
         valuation = self.aggregation_api.get_valuation(
-            valuation_request=valuation_request
+            valuation_request=valuation_request,
         )
 
         # Asserts
@@ -220,3 +222,7 @@ class Valuation(unittest.TestCase):
         self.assertEqual(valuation.data[0][valuation_key], 10000)
         self.assertEqual(valuation.data[1][valuation_key], 20000)
         self.assertEqual(valuation.data[2][valuation_key], 30000)
+
+
+if __name__ == "__main__":
+    unittest.main()
